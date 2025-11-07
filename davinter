@@ -1,0 +1,229 @@
+#!/usr/bin/env bash
+
+# Nama Program: davinter
+# Project: ernoba project
+# Versi: 3.1 (FIX: Beralih ke ProRes untuk kompatibilitas)
+
+# --- Fungsi Bantuan ---
+usage() {
+    echo "Penggunaan: davinter [options] <input_dir> <output_dir> [num_jobs]"
+    echo
+    echo "Argumen:"
+    echo "  <input_dir>   Folder input (default: 'videos')"
+    echo "  <output_dir>  Folder output (default: 'converted')"
+    echo "  [num_jobs]    Jumlah konversi paralel (default: 4)"
+    echo
+    echo "Options:"
+    echo "  --dry-run     Simulasikan konversi, jangan lakukan apa-apa."
+    echo "  --install-deps Tampilkan instruksi instalasi 'ffmpeg' untuk OS Anda."
+    echo "  -h, --help    Tampilkan pesan bantuan ini."
+    echo
+    echo "Contoh:"
+    echo "  davinter --dry-run ./koleksi_video ./hasil_edit 8"
+    echo "  davinter --install-deps"
+}
+
+# --- Fungsi Pemeriksa Dependensi (Kecerdasan "Auto-Install") ---
+check_deps() {
+    local install_mode=0
+    if [[ "$1" == "--install-deps" ]]; then
+        install_mode=1
+    fi
+
+    # Cek apakah ffmpeg & ffprobe ada
+    if command -v ffmpeg &> /dev/null && command -v ffprobe &> /dev/null; then
+        if ((install_mode)); then
+            echo "✅ 'ffmpeg' dan 'ffprobe' sudah terinstal."
+            exit 0
+        fi
+        return 0 # Dependensi OK
+    fi
+
+    # --- Jika dependensi TIDAK ada ---
+    
+    echo "❌ Error: 'ffmpeg' dan 'ffprobe' tidak ditemukan." >&2
+    
+    if ((install_mode)); then
+        echo "Ini adalah instruksi instalasi untuk OS Anda:"
+        if [ -f /etc/os-release ]; then
+            # Ambil ID OS dari /etc/os-release
+            . /etc/os-release
+            case $ID in
+                ubuntu|debian|pop|mint)
+                    echo "➡️  Jalankan: sudo apt update && sudo apt install ffmpeg"
+                    ;;
+                fedora)
+                    echo "Fedora membutuhkan RPM Fusion (jika belum ada):"
+                    echo "➡️  Jalankan: sudo dnf install https://download1.rpmfusion.org/free/fedora/rpmfusion-free-release-$(rpm -E %fedora).noarch.rpm https://download1.rpmfusion.org/nonfree/fedora/rpmfusion-nonfree-release-$(rpm -E %fedora).noarch.rpm"
+                    echo "➡️  Kemudian: sudo dnf install ffmpeg"
+                    ;;
+                arch|manjaro)
+                    echo "➡️  Jalankan: sudo pacman -S ffmpeg"
+                    ;;
+                *)
+                    echo "OS '$ID' tidak dikenali. Silakan instal 'ffmpeg' secara manual."
+                    ;;
+            esac
+        elif command -v brew &> /dev/null; then
+            echo "MacOS (Homebrew) terdeteksi."
+            echo "➡️  Jalankan: brew install ffmpeg"
+        else
+            echo "Tidak dapat mendeteksi OS. Silakan instal 'ffmpeg' dari situs resminya."
+        fi
+    else
+        echo "Silakan jalankan 'davinter --install-deps' untuk melihat cara instalasi." >&2
+    fi
+    
+    exit 1
+}
+
+# --- Parsing Argumen ---
+DRY_RUN=0
+POS_ARGS=() # Array untuk argumen posisi (input, output, jobs)
+
+# Loop melalui semua argumen
+while (("$#")); do
+    case "$1" in
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        --install-deps)
+            check_deps "--install-deps" # Panggil fungsi dalam mode instal
+            exit 0
+            ;;
+        --dry-run)
+            DRY_RUN=1
+            shift # Pindah ke argumen berikutnya
+            ;;
+        -*) # Jika argumen lain dimulai dengan -
+            echo "Error: Opsi tidak dikenal: $1" >&2
+            usage
+            exit 1
+            ;;
+        *) # Bukan opsi, pasti argumen posisi
+            POS_ARGS+=("$1")
+            shift # Pindah ke argumen berikutnya
+            ;;
+    esac
+done
+
+# Periksa dependensi (mode cek standar)
+check_deps
+
+# Setel argumen posisi yang sudah bersih
+INPUT_DIR="${POS_ARGS[0]:-videos}"
+OUTPUT_DIR="${POS_ARGS[1]:-converted}"
+NUM_JOBS="${POS_ARGS[2]:-4}"
+
+# --- Setup Variabel & Lingkungan ---
+INPUT_DIR=$(realpath "$INPUT_DIR")
+OUTPUT_DIR=$(realpath "$OUTPUT_DIR")
+LOG_DIR="$OUTPUT_DIR/davinter_logs" # Folder log khusus!
+
+mkdir -p "$OUTPUT_DIR"
+mkdir -p "$LOG_DIR" # Buat folder log
+
+# Ekspor variabel & fungsi untuk 'xargs'
+export INPUT_DIR
+export OUTPUT_DIR
+export LOG_DIR
+export DRY_RUN
+
+# Codec yang didukung (tidak perlu konversi)
+# 'prores' sudah ada di sini, jadi file prores yang ada tidak akan dikonversi ulang
+SUPPORTED_VIDEO=("dnxhd" "dnxhr" "prores" "h264" "hevc")
+SUPPORTED_AUDIO=("pcm_s16le" "pcm_s24le" "aac")
+export SUPPORTED_VIDEO
+export SUPPORTED_AUDIO
+
+# --- Fungsi Inti untuk Memproses Satu File ---
+process_file() {
+    local file="$1"
+    local filename=$(basename "$file")
+    
+    # Path relatif untuk meniru struktur folder
+    local relative_path="${file#$INPUT_DIR/}"
+    local output_subdir=$(dirname "$OUTPUT_DIR/$relative_path")
+    local output_file="$output_subdir/${filename%.*}_davinci.mov"
+    
+    # Log error per file!
+    local file_log="$LOG_DIR/${relative_path}.log"
+
+    mkdir -p "$output_subdir"
+    mkdir -p "$(dirname "$file_log")" # Pastikan folder log ada
+
+    local vcodec=$(ffprobe -v error -select_streams v:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$file")
+    local acodec=$(ffprobe -v error -select_streams a:0 -show_entries stream=codec_name -of default=noprint_wrappers=1:nokey=1 "$file")
+
+    echo "🧩 Memeriksa: $relative_path"
+
+    if [[ -z "$vcodec" ]]; then
+        echo "⚠️ Tidak ada stream video di '$filename'. Dilewati."
+        return
+    fi
+
+    # Cek kompatibilitas
+    if [[ " ${SUPPORTED_VIDEO[*]} " =~ " ${vcodec} " ]] && ([[ " ${SUPPORTED_AUDIO[*]} " =~ " ${acodec} " ]] || [[ -z "$acodec" ]]); then
+        echo "✅ '$relative_path' sudah kompatibel. Dilewati."
+        return
+    fi
+
+    # --- Mode Dry Run ---
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        echo "[DRY RUN] ⚙️ Akan mengonversi '$relative_path' (V: $vcodec, A: $acodec) ke ProRes HQ"
+        return
+    fi
+
+    # --- Mode Konversi ---
+    echo "⚙️ Mengonversi '$relative_path' (V: $vcodec, A: $acodec) ke ProRes HQ..."
+    
+    if ! ffmpeg -i "$file" \
+        -c:v prores_ks \
+        -profile:v 3 \
+        -pix_fmt yuv422p10le \
+        -c:a pcm_s16le -ar 48000 \
+        -movflags +faststart \
+        "$output_file" -y -hide_banner -loglevel error 2> "$file_log"; then
+        
+        # GAGAL
+        echo "❌ GAGAL '$relative_path'. Cek log di: $file_log"
+    else
+        # SUKSES
+        echo "✅ Dikonversi: ${output_file#$OUTPUT_DIR/}"
+        rm "$file_log" # Hapus log jika sukses (tidak perlu)
+    fi
+}
+
+export -f process_file
+
+# --- Eksekutor Utama ---
+if ((DRY_RUN)); then
+    echo "⚠️  --- MENJALANKAN DALAM MODE DRY RUN --- ⚠️"
+    echo "Tidak ada file yang akan benar-benar dikonversi."
+fi
+
+echo "🎬 Smart FFmpeg DaVinci Converter (davinter) v3.1 berjalan..."
+echo "Input     : $INPUT_DIR"
+echo "Output    : $OUTPUT_DIR"
+echo "Jobs Paralel: $NUM_JOBS"
+echo "Log Gagal : $LOG_DIR"
+echo "---"
+
+# Cari file dan jalankan paralel
+find "$INPUT_DIR" -type f -print0 | \
+    xargs -0 -P "$NUM_JOBS" -I {} bash -c 'process_file "{}"'
+
+echo "---"
+if ((DRY_RUN)); then
+    echo "🏁 Simulasi Dry Run selesai."
+else
+    echo "🚀 Selesai! Video yang telah dikonversi ada di: $OUTPUT_DIR"
+    # Cek apakah ada file log yang tersisa di folder log
+    if [ -n "$(find "$LOG_DIR" -type f -name "*.log" 2>/dev/null)" ]; then
+        echo "⚠️ Beberapa file gagal dikonversi. Silakan cek log di: $LOG_DIR"
+    else
+        echo "🎉 Semua konversi sukses!"
+        rmdir "$LOG_DIR" 2>/dev/null # Hapus folder log jika kosong
+    fi
+fi
